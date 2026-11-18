@@ -27,6 +27,8 @@ const BREAKOUT_BPS = 90n;
 const BREAKOUT_LOOKBACK = 5;
 const RECOVERY_BPS = 60n;
 const LOW_WINDOW = 120;
+// Minimum bars of history before the entry filter may fire at all.
+const MIN_HISTORY = 30;
 
 // Exits, all measured in bps from the entry bar's close (the fill lands one
 // bar later at the next open, so the realised exit differs by a few bps).
@@ -57,9 +59,14 @@ let position: Position | null = null;
 let cooldownUntilBar = -1;
 
 function lowOf(window: number): bigint | null {
-  if (closes.length < window) return null;
+  // Use however much history exists (at least MIN_HISTORY bars): the low is
+  // the window-to-date low early on, the rolling 120-bar low once the window
+  // is old enough. Requiring a full 120 bars before any entry would blindly
+  // discard every trigger in the first two hours of any window.
+  const n = Math.min(window, closes.length);
+  if (n < MIN_HISTORY) return null;
   let low = closes[closes.length - 1]!;
-  for (let i = closes.length - window; i < closes.length; i++) {
+  for (let i = closes.length - n; i < closes.length; i++) {
     if (closes[i]! < low) low = closes[i]!;
   }
   return low;
@@ -68,7 +75,7 @@ function lowOf(window: number): bigint | null {
 function shouldEnter(state: BarsState): boolean {
   if (position !== null) return false;
   if (state.warmingUp) return false;
-  if (closes.length < LOW_WINDOW) return false;
+  if (closes.length < MIN_HISTORY) return false;
   if (closes.length > LAST_ENTRY_BAR) return false;
   if (closes.length <= cooldownUntilBar) return false;
   if (state.cash <= 0n) return false;
