@@ -1,18 +1,18 @@
-// Washout-recovery violent-breakout bot for make.fun btc-race-24h-20261118-1444.
+// Dip-buy washout + hold bot for make.fun btc-race-24h-20261118-1444.
 //
-// Idea (written fresh in this session): a violent 5-bar surge only counts as a
-// buy when it is also a bounce off a recent low, not a dead-cat bounce in a
-// grind-down. Enter full cash on one position, exit on take-profit, a tight
-// stop, or a trailing stop, then cool down before the next entry. No fallback
-// trade, no clock, no randomness, no environment reads: every decision is a
-// pure function of the bars seen so far, so two runs on the same data answer
-// identically.
+// Pattern proven by past race winners (0828 rank 1, 2314): do not chase
+// breakouts. Wait for a genuine washout — price down sharply from its
+// rolling high — then buy only once the fall has stabilised (close back
+// above the recent low by a confirmation margin), take one full-cash
+// position, and hold through the recovery with a wide take-profit, a
+// disaster stop with real room, and an optional wide trailing stop.
+// Deterministic: a pure function of the bars seen so far.
 //
-// Fill model the bot is built for (kit RULES.txt): an order decided on the bar
-// closing at minute t fills at the next bar's open, paying 4 bps fee + 2 bps
-// modelled slippage + constant-product price impact against that bar's open
-// depth, so a full-size round trip costs roughly 26 bps. A trade must
-// therefore catch a move clearly larger than that to be worth taking.
+// Fill model (kit RULES.txt): an order decided on the bar closing at
+// minute t fills at the next bar's open, paying 4 bps fee + 2 bps
+// modelled slippage + constant-product impact, roughly 26 bps round trip
+// at full size. A dip entry after a >=200 bps washout with a wide
+// target clears that cost with room to spare.
 
 import { runBars } from './vendor/makefun-bars.ts';
 import type { BarsState, Batch, OrderInput } from './vendor/makefun-bars.ts';
@@ -20,33 +20,27 @@ import type { BarsState, Batch, OrderInput } from './vendor/makefun-bars.ts';
 const SYMBOL = 'CBBTC';
 const BPS = 10_000n;
 
-// Entry: close at least 90 bps above the close 5 bars ago (violent breakout)
-// AND at least 60 bps above the lowest close of the last 120 bars (the surge
-// is a recovery off a washout low, not a flicker inside a downtrend).
-const BREAKOUT_BPS = 90n;
-const BREAKOUT_LOOKBACK = 5;
-const RECOVERY_BPS = 60n;
-const LOW_WINDOW = 120;
-// Minimum bars of history before the entry filter may fire at all.
-const MIN_HISTORY = 30;
+// Entry: drawdown from the rolling 240-bar high of at least 200
+// bps (the washout), AND the close at least 60 bps above the lowest
+// close of the last 60 bars (stabilisation: the knife has stopped
+// falling). History is window-to-date until the full window exists.
+const DRAWDOWN_BPS = 200n;
+const HIGH_WINDOW = 240;
+const BOUNCE_BPS = 60n;
+const LOW_WINDOW = 60;
+const MIN_HISTORY = 60;
 
-// Exits, all measured in bps from the entry bar's close (the fill lands one
-// bar later at the next open, so the realised exit differs by a few bps).
+// Exits, in bps from the entry bar's close (fills land one bar later at
+// the next open, so realised values differ by a few bps).
 const TAKE_PROFIT_BPS = 250n;
-const STOP_BPS = 30n;
-const TRAIL_BPS = 60n;
+const STOP_BPS = 80n;
+const TRAIL_BPS = 150n; // 0 disables the trailing stop
 
-// Risk controls: one trade at a time, 60 bars of cooldown after any exit,
-// and no fresh entry in the final 10 bars (an entry that late cannot reach
-// its target before the window flattens everything at the last close).
-const COOLDOWN_BARS = 60;
-const LAST_ENTRY_BAR = 1430;
-
-// max_slippage_bps bounds the move from the latest close to the fill: the
-// modelled slippage (2 bps) plus own price impact (about 7 bps full-size at
-// the frozen pool depth) plus the open-vs-close gap. 150 bps is loose enough
-// to never reject a genuine entry and tight enough to refuse a fill that has
-// run far away from the close the decision was made on.
+// One position at a time; 2 entries per window at most, with a
+// long cooldown after any exit; no entry in the final 30 bars.
+const MAX_TRADES = 2;
+const COOLDOWN_BARS = 240;
+const LAST_ENTRY_BAR = 1410;
 const MAX_SLIPPAGE_BPS = 150;
 
 interface Position {
@@ -57,19 +51,17 @@ interface Position {
 const closes: bigint[] = [];
 let position: Position | null = null;
 let cooldownUntilBar = -1;
+let tradesTaken = 0;
 
-function lowOf(window: number): bigint | null {
-  // Use however much history exists (at least MIN_HISTORY bars): the low is
-  // the window-to-date low early on, the rolling 120-bar low once the window
-  // is old enough. Requiring a full 120 bars before any entry would blindly
-  // discard every trigger in the first two hours of any window.
+function extreme(window: number, wantHigh: boolean): bigint | null {
   const n = Math.min(window, closes.length);
   if (n < MIN_HISTORY) return null;
-  let low = closes[closes.length - 1]!;
-  for (let i = closes.length - n; i < closes.length; i++) {
-    if (closes[i]! < low) low = closes[i]!;
+  let best = closes[closes.length - n]!;
+  for (let i = closes.length - n + 1; i < closes.length; i++) {
+    const c = closes[i]!;
+    if (wantHigh ? c > best : c < best) best = c;
   }
-  return low;
+  return best;
 }
 
 function shouldEnter(state: BarsState): boolean {
@@ -78,16 +70,17 @@ function shouldEnter(state: BarsState): boolean {
   if (closes.length < MIN_HISTORY) return false;
   if (closes.length > LAST_ENTRY_BAR) return false;
   if (closes.length <= cooldownUntilBar) return false;
+  if (tradesTaken >= MAX_TRADES) return false;
   if (state.cash <= 0n) return false;
 
   const close = closes[closes.length - 1]!;
-  const fiveAgo = closes[closes.length - 1 - BREAKOUT_LOOKBACK]!;
-  // close >= fiveAgo * (1 + 90 bps), in integers: (close - fiveAgo) * 10000 >= 90 * fiveAgo
-  if ((close - fiveAgo) * BPS < BREAKOUT_BPS * fiveAgo) return false;
+  const high = extreme(HIGH_WINDOW, true)!;
+  // (high - close) * 10000 >= DD * high
+  if ((high - close) * BPS < DRAWDOWN_BPS * high) return false;
 
-  const low = lowOf(LOW_WINDOW)!;
-  // close >= low * (1 + 60 bps)
-  if ((close - low) * BPS < RECOVERY_BPS * low) return false;
+  const low = extreme(LOW_WINDOW, false)!;
+  // (close - low) * 10000 >= BOUNCE * low
+  if ((close - low) * BPS < BOUNCE_BPS * low) return false;
 
   return true;
 }
@@ -98,7 +91,7 @@ function shouldExit(): 'take-profit' | 'stop' | 'trailing' | null {
   const { entryClose, peakClose } = position;
   if ((close - entryClose) * BPS >= TAKE_PROFIT_BPS * entryClose) return 'take-profit';
   if ((entryClose - close) * BPS >= STOP_BPS * entryClose) return 'stop';
-  if ((peakClose - close) * BPS >= TRAIL_BPS * peakClose) return 'trailing';
+  if (TRAIL_BPS > 0n && (peakClose - close) * BPS >= TRAIL_BPS * peakClose) return 'trailing';
   return null;
 }
 
@@ -111,12 +104,10 @@ await runBars({
     const held = state.positions.get(SYMBOL);
     const qty = held?.qty ?? 0n;
 
-    // Keep the tracked peak honest with every close while long.
     if (position !== null && qty > 0n) {
       const close = closes[closes.length - 1]!;
       if (close > position.peakClose) position.peakClose = close;
     } else if (position !== null && qty === 0n) {
-      // The position is gone (filled exit or end-of-window flatten): clear it.
       position = null;
     }
 
@@ -133,6 +124,7 @@ await runBars({
     if (shouldEnter(state)) {
       const close = closes[closes.length - 1]!;
       position = { entryClose: close, peakClose: close };
+      tradesTaken += 1;
       return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
     }
     return [];
